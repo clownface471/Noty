@@ -2,12 +2,12 @@ use sqlx::SqlitePool;
 use std::time::Duration;
 use serde::Deserialize;
 
-// Struktur JSON balasan dari GitHub API
+// --- Struktur Data Respon GitHub ---
 #[derive(Debug, Deserialize)]
 struct GithubCommitResponse {
     sha: String,
     commit: CommitDetail,
-    author: Option<AuthorDetail>, // Bisa null kalau bot
+    author: Option<AuthorDetail>, 
 }
 
 #[derive(Debug, Deserialize)]
@@ -18,28 +18,30 @@ struct CommitDetail {
 
 #[derive(Debug, Deserialize)]
 struct CommitAuthor {
-    name: String,
+    name: String, // Nama Author di Git Config
     date: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct AuthorDetail {
-    login: String,
+    login: String, // Username GitHub
 }
 
-// Struktur User dari Database kita
+// --- Struktur User dari Database ---
 #[derive(sqlx::FromRow)]
 struct UserConfig {
+    #[allow(dead_code)] // Supaya compiler gak rewel kalau ID gak dipake
     id: i64,
     github_token: String,
     github_repo: String,
 }
 
+// --- Logic Utama Polling ---
 pub async fn start_polling(pool: SqlitePool) {
-    println!("👀 GitHub Watcher dimulai...");
+    println!("👀 GitHub Watcher (Polling Mode) Dimulai...");
 
     loop {
-        // 1. Ambil data user yang punya token & repo tersetting
+        // 1. Cari user yang punya token & repo valid
         let users: Vec<UserConfig> = sqlx::query_as(
             "SELECT id, github_token, github_repo FROM users WHERE github_token IS NOT NULL AND github_repo IS NOT NULL"
         )
@@ -47,18 +49,17 @@ pub async fn start_polling(pool: SqlitePool) {
         .await
         .unwrap_or_default();
 
-        if users.is_empty() {
-            // println!("(Zzz) Belum ada user yang setup GitHub...");
-        }
-
-        // 2. Loop setiap user
+        // 2. Cek update untuk setiap user
         for user in users {
             if let Err(e) = check_repo_updates(&pool, &user).await {
-                eprintln!("❌ Error checking repo {}: {}", user.github_repo, e);
+                // Ignore error 'Conflict' (Repo kosong) biar log gak penuh sampah
+                if !e.to_string().contains("409") {
+                    eprintln!("❌ Error checking repo {}: {}", user.github_repo, e);
+                }
             }
         }
 
-        // 3. Tidur 60 detik sebelum cek lagi (supaya gak kena rate limit)
+        // 3. Tidur 60 detik (Biar gak kena rate limit GitHub)
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
@@ -67,7 +68,6 @@ async fn check_repo_updates(pool: &SqlitePool, user: &UserConfig) -> Result<(), 
     let client = reqwest::Client::new();
     let url = format!("https://api.github.com/repos/{}/commits?per_page=5", user.github_repo);
 
-    // Request ke GitHub
     let response = client.get(&url)
         .header("User-Agent", "Noty-App")
         .header("Authorization", format!("Bearer {}", user.github_token))
@@ -80,18 +80,17 @@ async fn check_repo_updates(pool: &SqlitePool, user: &UserConfig) -> Result<(), 
 
     let commits: Vec<GithubCommitResponse> = response.json().await?;
 
-    // Proses Commit
     for commit in commits {
-        // Cek apakah hash ini sudah ada di DB?
+        // Cek duplikasi di database
         let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM github_logs WHERE commit_hash = ?)")
             .bind(&commit.sha)
             .fetch_one(pool)
             .await?;
 
         if !exists {
+            // Prioritas nama: Username GitHub -> Nama di Git Config
             let author_name = commit.author.map(|a| a.login).unwrap_or(commit.commit.author.name);
             
-            // Simpan ke DB
             sqlx::query(
                 "INSERT INTO github_logs (repo_name, commit_hash, message, author, timestamp) VALUES (?, ?, ?, ?, ?)"
             )
@@ -103,7 +102,7 @@ async fn check_repo_updates(pool: &SqlitePool, user: &UserConfig) -> Result<(), 
             .execute(pool)
             .await?;
 
-            println!("✨ Commit Baru Disimpan: [{}] {}", user.github_repo, commit.commit.message);
+            println!("✨ Commit Baru Masuk: [{}] {}", user.github_repo, commit.commit.message);
         }
     }
 
